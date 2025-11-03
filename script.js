@@ -7,18 +7,6 @@
    - Preserves: draggable leaderboard, seagull slider + Apply, physics, wind, sand/water, Twitch test wiring
 */
 
-// Connect to local WebSocket server
-const ws = new WebSocket("ws://localhost:3000");
-
-ws.onmessage = event => {
-  const data = JSON.parse(event.data);
-  handleChat(data); // Reuse your existing handleChat({ username, message })
-};
-
-ws.onopen = () => console.log("🟢 Connected to local server");
-ws.onclose = () => console.log("🔴 Disconnected from local server");
-
-
 console.log("Twitch Putt: script.js loaded");
 
 window.addEventListener("load", () => {
@@ -770,4 +758,5 @@ function loop(now){
 requestAnimationFrame(loop);
 
 console.log('Script initialization complete — leaderboard now uses strokes & holes (persistent).');
+
 
