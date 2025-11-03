@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Twitch Putt — vFinal</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link href="https://fonts.googleapis.com/css2?family=Bangers&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css" />
+
+  <!-- ✅ Load tmi.js from jsDelivr -->
+  <script src="https://cdn.jsdelivr.net/npm/tmi.js@1.8.5/dist/tmi.min.js"></script>
+</head>
+
+<body>
+  <div id="ui">
+    <h1>Twitch Putt — vFinal</h1>
+
+    <div id="controls">
+      <input id="channelName" placeholder="Twitch channel (no @)">
+      <input id="botName" placeholder="Bot username">
+      <input id="oauthToken" placeholder="oauth:..." type="password">
+      <button id="connectBtn">Connect</button>
+      <button id="disconnectBtn">Disconnect</button>
+
+      <div class="test-row">
+        <input id="testCommand" placeholder="Type test command e.g. !putt a 400">
+        <button id="testBtn">Test</button>
+        <button id="resetScores">Reset Scores</button>
+      </div>
+
+      <div id="status">Not connected</div>
+      <div id="help">Command format: <code>!putt &lt;a-z&gt; &lt;power 1-999&gt;</code> • Press <strong>F</strong> for fullscreen</div>
+    </div>
+  </div>
+
+  <div id="scoreboard" class="scoreboard">
+    <div class="title">🏆 Leaderboard</div>
+    <div id="lbList"></div>
+  </div>
+
+  <div id="banner" class="hidden">
+    <div id="bannerText"></div>
+  </div>
+
+  <div id="gameWrapper">
+    <canvas id="gameCanvas" width="1920" height="1080"></canvas>
+  </div>
+
+  <!-- Then your game script -->
+  <script src="script.js"></script>
+</body>
+</html>

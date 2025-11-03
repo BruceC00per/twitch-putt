@@ -1,0 +1,80 @@
+/* Twitch Putt - style.css (complete) */
+
+@import url('https://fonts.googleapis.com/css2?family=Luckiest+Guy&display=swap');
+
+:root{
+  --bg1:#08321a;
+  --green1:#43ff84;
+  --green2:#1d9b49;
+  --rough:#165f2c;
+  --muted:#bcd3b6;
+  --panel:rgba(0,0,0,0.45);
+}
+
+*{box-sizing:border-box}
+body{
+  margin:0;
+  background: linear-gradient(180deg,var(--bg1),#051d12);
+  color:#fff;
+  font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", Arial;
+  overflow:hidden;
+}
+
+/* UI controls top-left */
+#ui{
+  position: absolute;
+  left: 12px;
+  top: 8px;
+  z-index: 40;
+  background: rgba(0,0,0,0.28);
+  padding: 10px;
+  border-radius: 10px;
+  backdrop-filter: blur(4px);
+  min-width: 340px;
+}
+
+#ui h1{margin:0 0 8px 0;font-size:16px}
+#controls input{margin:4px 6px 4px 0;padding:7px;border-radius:6px;border:none;background:rgba(255,255,255,0.03);color:inherit}
+#controls button{margin:4px 6px 4px 0;padding:7px 10px;border-radius:8px;border:none;background:#7ee7c2;color:#022;cursor:pointer}
+.test-row{margin-top:6px;display:flex;gap:6px;align-items:center}
+#status{margin-top:6px;color:var(--muted)}
+#help{margin-top:6px;color:var(--muted);font-size:13px}
+
+/* Scoreboard overlay (draggable + resizable) */
+.scoreboard{
+  position:absolute;
+  left:12px;
+  top:110px;
+  z-index:45;
+  background:var(--panel);
+  padding:10px;
+  border-radius:10px;
+  width:240px;
+  min-width:140px;
+  max-width:420px;
+  user-select:none;
+  cursor:grab;
+  resize:both;
+  overflow:auto;
+  box-shadow:0 10px 36px rgba(0,0,0,0.6);
+}
+.scoreboard .title{font-weight:800;margin-bottom:8px;font-size:16px}
+.lb-row{display:flex;justify-content:space-between;padding:6px;border-radius:6px;margin-bottom:6px;background:rgba(255,255,255,0.03)}
+.lb-name{font-weight:700}
+.lb-score{opacity:0.95}
+
+/* Banner */
+#banner{
+  position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);
+  z-index:999;pointer-events:none;padding:18px 28px;border-radius:14px;font-weight:800;display:flex;align-items:center;
+  background:linear-gradient(90deg,#ffd166,#ff8fab);color:#081220;box-shadow:0 12px 40px rgba(0,0,0,0.6);
+  font-size:20px;
+}
+#banner.hidden{display:none}
+
+/* canvas container */
+#gameWrapper{position:absolute;left:0;top:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;z-index:10}
+#gameCanvas{border-radius:8px;box-shadow:0 20px 60px rgba(0,0,0,0.6);max-width:100%;height:auto;display:block}
+
+/* small code look */
+code{background:rgba(255,255,255,0.03);padding:2px 6px;border-radius:4px}
