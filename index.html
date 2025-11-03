@@ -60,15 +60,14 @@
 
   <!-- ✅ Your main game logic LAST -->
   <!-- ✅ Load tmi.js first -->
+<!-- ✅ Load working tmi.js from jsDelivr -->
 <script
-  src="https://cdnjs.cloudflare.com/ajax/libs/tmi.js/1.5.0/tmi.min.js"
-  integrity="sha512-5mG3+O2wEcTckRDC+qPAbcnDN6D8W+z8ZXO7M7PbJ8US91k57qJp6rrnM1PS1e6Fq9hS0/yM9BWgIlG39O8xVg=="
-  crossorigin="anonymous"
-  referrerpolicy="no-referrer"
-  onload="console.log('✅ tmi.js loaded successfully'); initGame();">
+  src="https://cdn.jsdelivr.net/gh/tmijs/tmi.js/dist/tmi.min.js"
+  onload="console.log('✅ tmi.js loaded successfully'); initGame();"
+  onerror="console.error('❌ Failed to load tmi.js');">
 </script>
 
-<!-- ✅ Lazy-load your game only after tmi.js is ready -->
+<!-- ✅ Load game script after tmi.js -->
 <script>
 function initGame() {
   const script = document.createElement('script');
@@ -77,6 +76,7 @@ function initGame() {
   document.body.appendChild(script);
 }
 </script>
+
 
 </body>
 </html>
