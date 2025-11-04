@@ -1,23 +1,31 @@
-/* Twitch Putt - vFinal (Leaderboard: realistic golf scoring + realistic seagull)
-   - Based on your "robust vFinal" base
-   - Adds:
-     * Seagull: more realistic body + flapping wings + shadow
-     * Leaderboard: Tracks Total Strokes and Holes Made; persisted to localStorage
-     * Leaderboard ranking: fewest strokes per hole made (avg); tie-breaker holes made desc, strokes asc
-   - Preserves: draggable leaderboard, seagull slider + Apply, physics, wind, sand/water, Twitch test wiring
+/* Twitch Putt - vFinal (Leaderboard: realistic golf scoring + realistic seagull + rounds)
+   - Full merged script: adds round capture timer, winners screen, hole-in-one leaderboard
+   - Drop this in place of your existing script.js (copy/paste)
 */
 
 console.log("Twitch Putt: script.js loaded");
 
+// optional local WebSocket relay connection (keeps your previous behavior)
+try {
+  const ws = new WebSocket("ws://localhost:3000");
+  ws.onmessage = event => {
+    const data = JSON.parse(event.data);
+    handleChat(data);
+  };
+  ws.onopen = () => console.log("🟢 Connected to local server");
+  ws.onclose = () => console.log("🔴 Disconnected from local server");
+} catch (e) {
+  // fail silently if no local server
+}
+
 window.addEventListener("load", () => {
   if (typeof tmi === "undefined") {
     console.error("⚠️ tmi.js not found — ensure tmi.min.js is loaded *before* script.js");
-    alert("Twitch chat not available. Please check your HTML script order and connection.");
+    // don't block; user may be using websocket relay
   } else {
     console.log("✅ tmi.js detected successfully");
   }
 });
-
 
 console.log('Twitch Putt - vFinal (Golf Leaderboard + realistic seagull) loaded');
 
@@ -35,10 +43,10 @@ const SAND_DRAG = 0.88;
 const STOP_SPEED = 0.2;
 const MAX_LIFE = 4.0;
 
-/* ---------- SAFE DOM CREATION (same as your base) ---------- */
-function ensureEl(id, tag='div', styles={}){
+/* ---------- SAFE DOM CREATION ---------- */
+function ensureEl(id, tag='div', styles={}) {
   let el = document.getElementById(id);
-  if (!el){
+  if (!el) {
     el = document.createElement(tag);
     el.id = id;
     Object.assign(el.style, styles);
@@ -106,31 +114,98 @@ if (!scoreboardPanel.querySelector('.title')) {
 }
 const lbList = ensureEl('lbList');
 
+/* ---------- HOLE-IN-ONE PANEL (matches main leaderboard style) ---------- */
+const hiPanel = ensureEl('hiLeaderboard', 'div', {
+  position: 'absolute',
+  left: '340px',
+  top: '80px',
+  width: '300px',
+  background: 'rgba(255,255,255,0.95)',
+  padding: '8px',
+  borderRadius: '8px',
+  zIndex: 2500,
+  boxShadow: '0 6px 18px rgba(0,0,0,0.2)',
+  fontFamily: 'Fredoka, Arial, sans-serif'
+});
+
+hiPanel.innerHTML = `
+  <div class="title"
+       style="font-weight:700;
+              font-size:20px;
+              margin-bottom:6px;
+              cursor:grab;
+              color:#222;
+              text-shadow:0 1px 2px rgba(255,255,255,0.4);">
+    🏅 Hole-in-One Leaderboard
+  </div>
+  <div id="hiList"
+       style="font-size:16px;
+              line-height:1.4;
+              color:#222;
+              background:rgba(255,255,255,0.85);
+              border-radius:6px;
+              overflow:hidden;">
+  </div>
+`;
+
+/* same drag + resize handling as main leaderboard */
+(function enableDragForHiPanel() {
+  const el = hiPanel;
+  const title = el.querySelector('.title');
+  let dragging = false, offX = 0, offY = 0;
+  title.addEventListener('pointerdown', e => {
+    dragging = true;
+    offX = e.clientX - el.offsetLeft;
+    offY = e.clientY - el.offsetTop;
+    title.setPointerCapture?.(e.pointerId);
+    title.style.cursor = 'grabbing';
+  });
+  document.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    el.style.left = (e.clientX - offX) + 'px';
+    el.style.top = (e.clientY - offY) + 'px';
+  });
+  document.addEventListener('pointerup', e => {
+    if (dragging) {
+      dragging = false;
+      title.style.cursor = 'grab';
+      try { title.releasePointerCapture?.(e.pointerId); } catch {}
+    }
+  });
+  el.style.resize = 'both';
+  el.style.overflow = 'auto';
+})();
+
 /* ---------- STATE ---------- */
 let client = null, connectedChannel = null;
 const balls = {};  // user -> { user, color, x,y, inHole, moving }
 const shots = [];  // moving shots
-// scoreboard map: user -> { strokes: n, holes: m }
+// scoreboard map: user -> { strokes: n, holes: m } (cumulative)
 let scoreboard = {};
+// hole-in-one counts: user -> count (persistent)
+let holeInOnes = {};
 let hole = { x: WIDTH/2, y: 200, r: HOLE_RADIUS };
 let sandTraps = [], waterHazards = [], hills = [];
 let wind = { angle: 0, speed: 0 };
 let seagull = null;
 let seagullProbPerFrame = 0.00002; // default conservative
 
+// ROUND: state for "first sink starts 30s window"
+let roundActive = false;
+let roundWinners = [];      // in-memory current round winners order
+let lastRoundWinners = [];  // persisted last winners (shows when no active round)
+let perHoleStrokes = {};    // strokes per user for the current hole (reset after round)
+let roundTimer = null;
+let ROUND_DURATION = 30000; // 30 seconds
+
 /* ---------- STORAGE ---------- */
-function saveScores(){
-  try { localStorage.setItem('twitchGolfScores', JSON.stringify(scoreboard)); }
-  catch(e) { console.warn(e); }
-}
-function loadScores(){
-  const raw = localStorage.getItem('twitchGolfScores');
-  if (raw) {
-    try { scoreboard = JSON.parse(raw); }
-    catch(e){ console.warn('loadScores failed', e); }
-  }
-}
-loadScores();
+function saveScores(){ try { localStorage.setItem('twitchGolfScores', JSON.stringify(scoreboard)); } catch(e) { console.warn(e); } }
+function loadScores(){ const raw = localStorage.getItem('twitchGolfScores'); if (raw) try { scoreboard = JSON.parse(raw); } catch(e){ console.warn('loadScores failed', e); } }
+function saveHoleInOnes(){ try { localStorage.setItem('twitchHI', JSON.stringify(holeInOnes)); } catch(e){} }
+function loadHoleInOnes(){ const raw = localStorage.getItem('twitchHI'); if (raw) try { holeInOnes = JSON.parse(raw); } catch(e){ console.warn('loadHI failed', e); } }
+function saveLastWinners(){ try { localStorage.setItem('twitchLastWinners', JSON.stringify(lastRoundWinners)); } catch(e){} }
+function loadLastWinners(){ const raw = localStorage.getItem('twitchLastWinners'); if (raw) try { lastRoundWinners = JSON.parse(raw); } catch(e){ console.warn('loadLastWinners failed', e); } }
+loadScores(); loadHoleInOnes(); loadLastWinners();
 
 /* ---------- UTILS ---------- */
 const rand = (a,b) => a + Math.random() * (b - a);
@@ -179,20 +254,23 @@ function randomizeCourse(){
 }
 randomizeCourse();
 
-function heightAt(x,y){
-  const nx = (x - ROUGH_ZONE) / (WIDTH - 2*ROUGH_ZONE);
-  let base = Math.sin(nx*3.0) * 12 + Math.sin(nx*6.5) * 4;
-  for (const h of hills){
+function heightAt(x, y) {
+  // more dramatic vertical height variation
+  const nx = (x - ROUGH_ZONE) / (WIDTH - 2 * ROUGH_ZONE);
+  let base = Math.sin(nx * 2.5) * 22 + Math.sin(nx * 5.2) * 9; // increased amplitude
+  for (const h of hills) {
     const dx = x - h.x, dy = y - h.y;
-    const d = Math.sqrt(dx*dx + dy*dy);
-    if (d < h.r) base += h.h * (1 - d/h.r) * 20;
+    const d = Math.sqrt(dx * dx + dy * dy);
+    if (d < h.r) base += h.h * (1 - d / h.r) * 38; // stronger hills
   }
   return base;
 }
-function slopeAt(x,y){
-  const e = 4;
-  return (heightAt(x+e,y) - heightAt(x-e,y)) / (2*e);
+
+function slopeAt(x, y) {
+  const e = 6; // wider slope sampling for smoother but stronger rolls
+  return (heightAt(x + e, y) - heightAt(x - e, y)) / (2 * e);
 }
+
 
 /* ---------- BALLS & CHAT ---------- */
 function ensureBall(user){
@@ -207,6 +285,8 @@ function ensureBall(user){
 function addStrokeToPlayer(user){
   if (!scoreboard[user]) scoreboard[user] = { strokes: 0, holes: 0 };
   scoreboard[user].strokes += 1;
+  // per-hole strokes tracking (for hole-in-one detection)
+  perHoleStrokes[user] = (perHoleStrokes[user] || 0) + 1;
   saveScores();
 }
 
@@ -306,17 +386,41 @@ function stepPhysics(dt = 1/60){
 
     const dx = s.x - hole.x, dy = s.y - hole.y, dist = Math.hypot(dx, dy);
     if (dist < HOLE_RADIUS && sp < 5) {
-      shots.splice(i,1);
-      const b = balls[s.user];
-      if (b) { b.x = hole.x; b.y = hole.y; b.inHole = true; b.moving = false; }
-      // record hole made
-      if (!scoreboard[s.user]) scoreboard[s.user] = { strokes: 0, holes: 0 };
-      scoreboard[s.user].holes += 1;
-      saveScores();
-      showBanner(`${s.user} sank it!`);
-      randomizeCourse();
-      refreshUI();
-      continue;
+      // sink handling
+     shots.splice(i, 1);
+     const b = balls[s.user];
+     if (b) { b.x = hole.x; b.y = hole.y; b.inHole = true; b.moving = false; }
+
+     // record hole made (cumulative scoreboard)
+     if (!scoreboard[s.user]) scoreboard[s.user] = { strokes: 0, holes: 0 };
+     scoreboard[s.user].holes += 1;
+     saveScores();
+
+     // detect hole-in-one (perHoleStrokes == 1)
+     if ((perHoleStrokes[s.user] || 0) === 1) {
+       holeInOnes[s.user] = (holeInOnes[s.user] || 0) + 1;
+       saveHoleInOnes();
+       showBanner(`${s.user} scored a HOLE IN ONE!`);
+     }
+
+     // 🟢 ROUND LOGIC
+     if (!roundActive) {
+       // first sink starts the round
+       roundActive = true;
+       roundWinners = [s.user];
+       startRoundTimer();
+       showBanner(`${s.user} starts the round! 30s to get in (next 3 finishers).`);
+     } else if (roundWinners.length < 4 && !roundWinners.includes(s.user)) {
+       roundWinners.push(s.user);
+       showBanner(`${s.user} finished #${roundWinners.length}!`);
+       if (roundWinners.length === 4) {
+         // immediate end if 4 finishers
+         endRound();
+       }
+     }
+
+     refreshUI();
+     continue;
     }
 
     const b = balls[s.user];
@@ -324,7 +428,57 @@ function stepPhysics(dt = 1/60){
   }
 }
 
-/* ---------- SEAGULL (more realistic drawing & behavior) ---------- */
+/* ---------- ROUND COUNTDOWN UI ---------- */
+let timerEl = null;
+function ensureTimerEl() {
+  if (!timerEl) {
+    timerEl = document.createElement('div');
+    Object.assign(timerEl.style, {
+      position: 'absolute',
+      top: '20px',
+      right: '20px',
+      background: 'rgba(0,0,0,0.7)',
+      color: '#fff',
+      fontFamily: 'Fredoka, Arial, sans-serif',
+      fontWeight: '700',
+      fontSize: '22px',
+      padding: '10px 20px',
+      borderRadius: '12px',
+      boxShadow: '0 0 20px rgba(0,0,0,0.4)',
+      zIndex: 4000,
+      transition: 'opacity 0.3s'
+    });
+    document.body.appendChild(timerEl);
+  }
+  return timerEl;
+}
+
+let countdownInterval = null;
+function showRoundCountdown(durationMs) {
+  const el = ensureTimerEl();
+  let remaining = Math.ceil(durationMs / 1000);
+  el.textContent = `⏳ ${remaining}s remaining`;
+  el.style.opacity = '1';
+
+  clearInterval(countdownInterval);
+  countdownInterval = setInterval(() => {
+    remaining -= 1;
+    if (remaining <= 0) {
+      clearInterval(countdownInterval);
+      el.style.opacity = '0';
+    } else {
+      el.textContent = `⏳ ${remaining}s remaining`;
+    }
+  }, 1000);
+}
+
+function hideRoundCountdown() {
+  if (timerEl) timerEl.style.opacity = '0';
+  clearInterval(countdownInterval);
+}
+
+
+/* ---------- SEAGULL (realistic) ---------- */
 function startSeagullEvent(manual=false){
   const keys = Object.keys(balls).filter(u => !balls[u].inHole);
   if (keys.length === 0) return;
@@ -380,7 +534,6 @@ function updateSeagull(dt){
       s.carrying = true;
       s.state = 'flyoff';
       s.dropTarget = safeDropLocation(80);
-      // ensure not water
       if (inZone(s.dropTarget.x, s.dropTarget.y, waterHazards)) s.dropTarget = safeDropLocation(100);
       const dx = s.dropTarget.x - s.x, dy = s.dropTarget.y - s.y; const d = Math.hypot(dx,dy) || 1;
       s.vx = (dx/d) * rand(5,9);
@@ -391,7 +544,6 @@ function updateSeagull(dt){
     if (ball) { ball.x = s.x; ball.y = s.y + 6; ball.moving = false; }
     const d = Math.hypot(s.x - s.dropTarget.x, s.y - s.dropTarget.y);
     if (d < 44) {
-      // never drop in water
       if (!inZone(s.dropTarget.x, s.dropTarget.y, waterHazards)) {
         if (ball) { ball.x = s.dropTarget.x; ball.y = s.dropTarget.y; ball.moving = false; }
         s.carrying = false;
@@ -411,18 +563,16 @@ function updateSeagull(dt){
   s.x += s.vx * clamp(dt*60, 0.25, 2.5);
   s.y += s.vy * clamp(dt*60, 0.25, 2.5);
 
-  // if carrying, keep ball attached
   if (s.carrying && balls[s.targetUser]) {
     balls[s.targetUser].x = s.x;
     balls[s.targetUser].y = s.y + 8;
     balls[s.targetUser].moving = false;
   }
 
-  // remove offscreen
   if (s.x < -360 || s.x > WIDTH + 360 || s.y < -360) seagull = null;
 }
 
-/* Realistic seagull draw: body + wings + beak + shadow */
+/* Realistic seagull draw */
 function drawRealSeagull(s){
   ctx.save();
   ctx.translate(s.x, s.y);
@@ -435,11 +585,10 @@ function drawRealSeagull(s){
   ctx.fillStyle = 'rgba(0,0,0,0.15)';
   ctx.fill();
 
-  // wing flap parameters
   const t = performance.now() / 140;
   const flap = Math.sin(t + (s.wingPhase||0)) * 12 + Math.cos(t*0.5)*(s.size*2);
 
-  // left wing (visible large)
+  // wing
   ctx.beginPath();
   ctx.moveTo(-6, 0);
   ctx.quadraticCurveTo(-28, -26 - flap, 14, -8);
@@ -447,7 +596,7 @@ function drawRealSeagull(s){
   ctx.fillStyle = '#ffffff';
   ctx.fill();
 
-  // wing tip darker
+  // wing tip
   ctx.beginPath();
   ctx.moveTo(-8, -6);
   ctx.quadraticCurveTo(-24, -18 - flap, -6, -2);
@@ -458,19 +607,6 @@ function drawRealSeagull(s){
   ctx.beginPath();
   ctx.ellipse(2, 6, 16, 12, 0, 0, Math.PI*2);
   ctx.fillStyle = '#f7f7f7';
-  ctx.fill();
-  // belly slight gray
-  ctx.beginPath();
-  ctx.ellipse(2, 9, 12, 8, 0, 0, Math.PI*2);
-  ctx.fillStyle = '#efefef';
-  ctx.fill();
-
-  // tail
-  ctx.beginPath();
-  ctx.moveTo(-14, 8);
-  ctx.lineTo(-22, 12);
-  ctx.lineTo(-10, 12);
-  ctx.fillStyle = '#e6e6e6';
   ctx.fill();
 
   // beak
@@ -492,27 +628,33 @@ function drawRealSeagull(s){
 }
 
 /* ---------- RENDER ---------- */
-function drawScene(){
-  // grass bg
-  const g = ctx.createLinearGradient(0,0,0,HEIGHT);
-  g.addColorStop(0,'#3ad157'); g.addColorStop(1,'#1e8e3f');
-  ctx.fillStyle = g; ctx.fillRect(0,0,WIDTH,HEIGHT);
+function drawScene() {
+  // background grass
+  const g = ctx.createLinearGradient(0, 0, 0, HEIGHT);
+  g.addColorStop(0, '#3ad157');
+  g.addColorStop(1, '#1e8e3f');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
 
-  // hills
-  for (const h of hills){
-    const grad = ctx.createRadialGradient(h.x,h.y,0,h.x,h.y,h.r);
-    grad.addColorStop(0,'rgba(255,255,255,0.06)');
-    grad.addColorStop(0.6,'rgba(255,255,255,0.02)');
-    grad.addColorStop(1,'rgba(0,0,0,0.06)');
-    ctx.fillStyle = grad; ctx.beginPath(); ctx.arc(h.x,h.y,h.r,0,Math.PI*2); ctx.fill();
+  // hills first (under everything)
+  for (const h of hills) {
+    const grad = ctx.createRadialGradient(h.x, h.y, 0, h.x, h.y, h.r);
+    grad.addColorStop(0, 'rgba(255,255,255,0.10)');
+    grad.addColorStop(0.6, 'rgba(255,255,255,0.03)');
+    grad.addColorStop(1, 'rgba(0,0,0,0.08)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(h.x, h.y, h.r, 0, Math.PI * 2);
+    ctx.fill();
   }
-
-  // rough borders
+  
+// rough borders
   ctx.fillStyle = '#164f2b';
-  ctx.fillRect(0,0,WIDTH,ROUGH_ZONE);
-  ctx.fillRect(0,HEIGHT-ROUGH_ZONE,WIDTH,ROUGH_ZONE);
-  ctx.fillRect(0,0,ROUGH_ZONE,HEIGHT);
-  ctx.fillRect(WIDTH-ROUGH_ZONE,0,ROUGH_ZONE,HEIGHT);
+  ctx.fillRect(0, 0, WIDTH, ROUGH_ZONE);
+  ctx.fillRect(0, HEIGHT - ROUGH_ZONE, WIDTH, ROUGH_ZONE);
+  ctx.fillRect(0, 0, ROUGH_ZONE, HEIGHT);
+  ctx.fillRect(WIDTH - ROUGH_ZONE, 0, ROUGH_ZONE, HEIGHT);
+
 
   // water
   for (const w of waterHazards){
@@ -536,7 +678,7 @@ function drawScene(){
   const fx = Math.cos(flagAngle) * flagLen; const fy = Math.sin(flagAngle) * flagLen;
   ctx.beginPath(); ctx.moveTo(poleX+2, hole.y - poleHeight); ctx.lineTo(poleX + fx + 2, hole.y - poleHeight + fy + 8); ctx.lineTo(poleX+2, hole.y - poleHeight + 16); ctx.closePath(); ctx.fillStyle = '#ff3d6b'; ctx.fill();
 
-  // seagull UNDER balls so it can carry them
+  // seagull under balls
   if (seagull) drawRealSeagull(seagull);
 
   // shots
@@ -544,14 +686,10 @@ function drawScene(){
   // persistent balls
   for (const u in balls) { const b = balls[u]; drawBall(b.x, b.y, b.color, b.user, b.inHole); }
 
-  // HUD
-
-
   // wind indicator
   drawWindIndicator();
 }
 
-/* drawBall similar to base but keep names readable */
 function drawBall(x,y,color,user,inMotion=false){
   // shadow
   ctx.beginPath(); ctx.ellipse(x+6,y+14,14,6,0,0,Math.PI*2); ctx.fillStyle='rgba(0,0,0,0.22)'; ctx.fill();
@@ -559,7 +697,7 @@ function drawBall(x,y,color,user,inMotion=false){
   const grad = ctx.createRadialGradient(x-4,y-4,2,x,y,BALL_RADIUS); grad.addColorStop(0,'#fff'); grad.addColorStop(1,color);
   ctx.fillStyle = grad; ctx.beginPath(); ctx.arc(x,y,BALL_RADIUS,0,Math.PI*2); ctx.fill();
 
-  // name label - simpler font, high contrast
+  // name label - simpler, high contrast
   ctx.save();
   ctx.font = '700 18px Arial, sans-serif';
   ctx.textAlign = 'center';
@@ -578,46 +716,63 @@ function drawWindIndicator(){
   ctx.fillText(`Wind: ${wind.speed.toFixed(1)}`, cx, cy + 38);
 }
 
-/* ---------- LEADERBOARD (golf style) ---------- */
-/* Scoreboard structure: scoreboard[user] = { strokes: n, holes: m } */
+/* ---------- LEADERBOARDS ---------- */
 
-// ranking function: fewest strokes per hole made (lower average wins).
-// players with 0 holes get a penalty so they rank lower. tie-breaker: holes desc, strokes asc
-function leaderboardEntries(){
-  const keys = Object.keys(scoreboard);
-  return keys.map(u => {
-    const s = scoreboard[u] || { strokes:0, holes:0 };
-    const avg = s.holes > 0 ? (s.strokes / s.holes) : (s.strokes + 100000); // penalty for 0 holes
-    return { user: u, strokes: s.strokes, holes: s.holes, avg };
-  }).sort((a,b) => {
-    if (a.avg !== b.avg) return a.avg - b.avg;
-    if (a.holes !== b.holes) return b.holes - a.holes;
-    if (a.strokes !== b.strokes) return a.strokes - b.strokes;
-    return a.user.localeCompare(b.user);
-  });
-}
-
+/* MAIN leader: now shows only the current round winners (1-4).
+   If no current winners and lastRoundWinners exist, show lastRoundWinners.
+*/
 function refreshUI(){
-  // render HTML list in lbList as a golf-style table
+  // MAIN winners display in lbList
   lbList.innerHTML = '';
   const header = document.createElement('div');
   header.style.display = 'flex'; header.style.justifyContent = 'space-between'; header.style.fontWeight = '700'; header.style.marginBottom = '6px';
-  header.innerHTML = `<div style="width:32px;text-align:left">#</div><div style="flex:1;text-align:left">Player</div><div style="width:70px;text-align:right">Strokes</div><div style="width:70px;text-align:right">Holes</div>`;
+  header.innerHTML = `<div style="width:32px;text-align:left">#</div><div style="flex:1;text-align:left">Winner</div>`;
   lbList.appendChild(header);
 
-  const entries = leaderboardEntries();
-  entries.forEach((e, idx) => {
-    const row = document.createElement('div');
-    row.style.display = 'flex'; row.style.alignItems = 'center'; row.style.justifyContent = 'space-between';
-    row.style.padding = '6px 4px'; row.style.borderTop = '1px solid rgba(0,0,0,0.06)';
-    if (idx === 0) row.style.background = 'linear-gradient(90deg, rgba(255,215,80,0.12), rgba(255,255,255,0))'; // gold tint for leader
-    const nameCol = document.createElement('div'); nameCol.style.flex = '1'; nameCol.style.textAlign = 'left'; nameCol.textContent = e.user;
-    const rankCol = document.createElement('div'); rankCol.style.width = '32px'; rankCol.textContent = (idx+1) + '';
-    const strokesCol = document.createElement('div'); strokesCol.style.width = '70px'; strokesCol.style.textAlign = 'right'; strokesCol.textContent = e.strokes;
-    const holesCol = document.createElement('div'); holesCol.style.width = '70px'; holesCol.style.textAlign = 'right'; holesCol.textContent = e.holes;
-    row.appendChild(rankCol); row.appendChild(nameCol); row.appendChild(strokesCol); row.appendChild(holesCol);
-    lbList.appendChild(row);
-  });
+  const winnersToShow = roundWinners.length ? roundWinners : lastRoundWinners;
+  if (winnersToShow && winnersToShow.length) {
+    winnersToShow.forEach((u, idx) => {
+      const row = document.createElement('div');
+      row.style.display = 'flex'; row.style.alignItems = 'center'; row.style.justifyContent = 'space-between';
+      row.style.padding = '6px 4px'; row.style.borderTop = '1px solid rgba(0,0,0,0.06)';
+      if (idx === 0) row.style.background = 'linear-gradient(90deg, rgba(255,215,80,0.12), rgba(255,255,255,0))';
+      const nameCol = document.createElement('div'); nameCol.style.flex = '1'; nameCol.style.textAlign = 'left'; nameCol.textContent = u;
+      const rankCol = document.createElement('div'); rankCol.style.width = '32px'; rankCol.textContent = (idx+1) + '';
+      row.appendChild(rankCol); row.appendChild(nameCol);
+      lbList.appendChild(row);
+    });
+  } else {
+    const empty = document.createElement('div');
+    empty.style.padding = '8px'; empty.style.opacity = 0.7;
+    empty.textContent = 'No winners yet. First sink starts the round.';
+    lbList.appendChild(empty);
+  }
+
+  // HOLE-IN-ONE leaderboard
+  hiList.innerHTML = '';
+  const hh = document.createElement('div');
+  hh.style.display = 'flex'; hh.style.justifyContent = 'space-between'; hh.style.fontWeight = '700'; hh.style.marginBottom = '6px';
+  hh.innerHTML = `<div style="width:32px;text-align:left">#</div><div style="flex:1;text-align:left">Player</div><div style="width:70px;text-align:right">HIO</div>`;
+  hiList.appendChild(hh);
+
+  const hiEntries = Object.keys(holeInOnes).map(u => ({ user:u, count: holeInOnes[u] })).sort((a,b)=>b.count-a.count||a.user.localeCompare(b.user));
+  if (hiEntries.length === 0) {
+    const none = document.createElement('div');
+    none.style.padding = '8px'; none.style.opacity = 0.7;
+    none.textContent = 'No hole-in-ones yet.';
+    hiList.appendChild(none);
+  } else {
+    hiEntries.forEach((e, idx) => {
+      const row = document.createElement('div');
+      row.style.display = 'flex'; row.style.alignItems = 'center'; row.style.justifyContent = 'space-between';
+      row.style.padding = '6px 4px'; row.style.borderTop = '1px solid rgba(0,0,0,0.06)';
+      const rankCol = document.createElement('div'); rankCol.style.width = '32px'; rankCol.textContent = (idx+1)+'';
+      const nameCol = document.createElement('div'); nameCol.style.flex='1'; nameCol.textContent = e.user;
+      const cCol = document.createElement('div'); cCol.style.width='70px'; cCol.style.textAlign='right'; cCol.textContent = e.count;
+      row.appendChild(rankCol); row.appendChild(nameCol); row.appendChild(cCol);
+      hiList.appendChild(row);
+    });
+  }
 
   statusEl.textContent = connectedChannel ? `Connected: ${connectedChannel}` : 'Not connected';
 }
@@ -630,9 +785,87 @@ function showBanner(text){
   setTimeout(()=>{ bannerWrap.style.opacity = '0'; }, 2200);
 }
 
+/* ---------- ROUND TIMERS & WINNER SCREEN ---------- */
+function startRoundTimer() {
+  if (roundTimer) clearTimeout(roundTimer);
+  showRoundCountdown(ROUND_DURATION); // 🟢 add this line
+  roundTimer = setTimeout(() => {
+    console.log("⏰ Round timer expired");
+    endRound();
+  }, ROUND_DURATION);
+}
+
+
+function endRound(){
+  // stop timer
+  if (roundTimer) { clearInterval(roundTimer); roundTimer = null; }
+
+  // finalize winners list (roundWinners may have 1..4 players)
+  lastRoundWinners = roundWinners.slice(); // persist last winners
+  saveLastWinners();
+
+  hideRoundCountdown();
+
+  // show winners screen
+  showWinnersScreen();
+
+  // reset round state
+  roundActive = false;
+  roundWinners = [];
+
+  // clear balls/shots and per-hole strokes
+  clearAllBallsAndShots();
+
+  // reset per-hole strokes
+  perHoleStrokes = {};
+  refreshUI();
+}
+
+function showWinnersScreen(){
+  const overlay = ensureEl('winnersScreen', 'div', {
+    position: 'absolute',
+    left: '50%',
+    top: '50%',
+    transform: 'translate(-50%, -50%)',
+    zIndex: 5000,
+    background: 'rgba(0,0,0,0.85)',
+    color: '#fff',
+    fontFamily: 'Fredoka, Arial, sans-serif',
+    fontSize: '32px',
+    textAlign: 'center',
+    padding: '40px 60px',
+    borderRadius: '20px',
+    boxShadow: '0 0 40px rgba(0,0,0,0.6)',
+  });
+
+  const header = `🏆 Round Results`;
+  const list = lastRoundWinners.length
+    ? lastRoundWinners.map((u, i) => `<div style="margin:8px 0;">${i+1}. ${u}</div>`).join('')
+    : `<div>No players finished this round.</div>`;
+  overlay.innerHTML = `<div style="font-size:42px;margin-bottom:20px;">${header}</div>${list}`;
+
+  setTimeout(() => {
+    overlay.remove();
+    randomizeCourse();
+    // ensure balls cleared already, but also make sure none are marked inHole
+    for (const u in balls) { balls[u].inHole = false; balls[u].moving = false; }
+    refreshUI();
+    showBanner("Next round begins when someone putts!");
+  }, 8000);
+}
+
+function clearAllBallsAndShots(){
+  // remove all balls and active shots from the field
+  // preserve scoreboard & holeInOnes
+  for (const u in balls) {
+    // either remove players entirely (so they must !putt to rejoin)
+    delete balls[u];
+  }
+  shots.length = 0;
+}
+
 /* ---------- Seagull slider UI (Apply) - retained ---------- */
 (function setupSeagullSlider(){
-  // create wrapper inside uiRoot (if not present)
   const existing = document.getElementById('sgBlock');
   if (existing) return;
   const wrap = document.createElement('div');
@@ -683,21 +916,23 @@ function showBanner(text){
 function toggleFullscreen(){ if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(()=>{}); else document.exitFullscreen().catch(()=>{}); }
 document.addEventListener('keydown', e => { if (e.key === 'f' || e.key === 'F') toggleFullscreen(); });
 document.addEventListener('fullscreenchange', ()=> {
-  if (document.fullscreenElement) { uiRoot.style.display = 'none'; scoreboardPanel.style.display = 'block'; }
-  else { uiRoot.style.display = ''; scoreboardPanel.style.display = 'block'; }
+  if (document.fullscreenElement) { uiRoot.style.display = 'none'; scoreboardPanel.style.display = 'block'; hiPanel.style.display = 'block'; }
+  else { uiRoot.style.display = ''; scoreboardPanel.style.display = 'block'; hiPanel.style.display = 'block'; }
 });
 
-// draggable scoreboard (original behavior)
+// draggable scoreboard + hiPanel
 (function enableDrag(){
-  const el = scoreboardPanel;
-  if (!el) return;
-  const title = el.querySelector('.title') || el;
-  title.style.cursor = 'grab';
-  let dragging = false, offX = 0, offY = 0;
-  title.addEventListener('pointerdown', e => { dragging = true; offX = e.clientX - el.offsetLeft; offY = e.clientY - el.offsetTop; title.setPointerCapture?.(e.pointerId); title.style.cursor = 'grabbing'; });
-  document.addEventListener('pointermove', e => { if (!dragging) return; el.style.left = (e.clientX - offX) + 'px'; el.style.top = (e.clientY - offY) + 'px'; });
-  document.addEventListener('pointerup', e => { if (dragging) { dragging = false; title.style.cursor = 'grab'; try { title.releasePointerCapture?.(e.pointerId); } catch(e){} } });
-  el.style.resize = 'both'; el.style.overflow = 'auto';
+  const panels = [scoreboardPanel, hiPanel];
+  panels.forEach(el => {
+    if (!el) return;
+    const title = el.querySelector('.title') || el;
+    title.style.cursor = 'grab';
+    let dragging = false, offX = 0, offY = 0;
+    title.addEventListener('pointerdown', e => { dragging = true; offX = e.clientX - el.offsetLeft; offY = e.clientY - el.offsetTop; title.setPointerCapture?.(e.pointerId); title.style.cursor = 'grabbing'; });
+    document.addEventListener('pointermove', e => { if (!dragging) return; el.style.left = (e.clientX - offX) + 'px'; el.style.top = (e.clientY - offY) + 'px'; });
+    document.addEventListener('pointerup', e => { if (dragging) { dragging = false; title.style.cursor = 'grab'; try { title.releasePointerCapture?.(e.pointerId); } catch(e){} } });
+    el.style.resize = 'both'; el.style.overflow = 'auto';
+  });
 })();
 
 /* ---------- TWITCH connect wiring (optional tmi.js) ---------- */
@@ -718,10 +953,10 @@ function connectTwitch(){
 }
 document.getElementById('connectBtn')?.addEventListener('click', connectTwitch);
 document.getElementById('disconnectBtn')?.addEventListener('click', ()=> { if (client) client.disconnect().catch(()=>{}); client = null; connectedChannel = null; refreshUI(); });
-document.getElementById('resetScores')?.addEventListener('click', ()=> { if (!confirm('Clear stored leaderboard?')) return; localStorage.removeItem('twitchGolfScores'); scoreboard = {}; refreshUI(); });
+document.getElementById('resetScores')?.addEventListener('click', ()=> { if (!confirm('Clear stored leaderboard?')) return; localStorage.removeItem('twitchGolfScores'); localStorage.removeItem('twitchHI'); localStorage.removeItem('twitchLastWinners'); scoreboard = {}; holeInOnes = {}; lastRoundWinners = []; saveScores(); saveHoleInOnes(); saveLastWinners(); refreshUI(); });
 document.getElementById('testBtn')?.addEventListener('click', ()=> { const c = document.getElementById('testCommand')?.value.trim(); if (c) handleChat({ username: 'Tester', message: c }); });
 
-/* Test seagull button (adds to uiRoot) */
+/* Test seagull button */
 const testSG = document.createElement('button');
 testSG.textContent = '🕊️ Test Seagull';
 testSG.style.marginLeft = '8px';
@@ -758,5 +993,3 @@ function loop(now){
 requestAnimationFrame(loop);
 
 console.log('Script initialization complete — leaderboard now uses strokes & holes (persistent).');
-
-
