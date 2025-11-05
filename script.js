@@ -34,7 +34,7 @@ const WIDTH = 1920, HEIGHT = 1080;
 const ROUGH_ZONE = 60;
 const START_Y = HEIGHT - 120;
 const BALL_RADIUS = 12;
-const HOLE_RADIUS = 16;
+const HOLE_RADIUS = 19;
 const POWER_MAX = 999;
 const LOCATIONS = Array.from({length:26},(_,i)=>String.fromCharCode(97+i));
 
@@ -42,6 +42,10 @@ const AIR_DRAG = 0.986;
 const SAND_DRAG = 0.88;
 const STOP_SPEED = 0.2;
 const MAX_LIFE = 4.0;
+// 3D-like drive physics
+const GRAVITY = 0.5;         // how fast drives fall
+const DRIVE_POWER_MULT = .9; // tune how far drives travel (1.0 = same horizontal speed as putt)
+
 
 /* ---------- SAFE DOM CREATION ---------- */
 function ensureEl(id, tag='div', styles={}) {
@@ -192,11 +196,13 @@ let seagullProbPerFrame = 0.00002; // default conservative
 
 // ROUND: state for "first sink starts 30s window"
 let roundActive = false;
+let roundCooldown = false; // prevents shots between rounds
+let nextRoundTimer = null;   // handle for the countdown timer
 let roundWinners = [];      // in-memory current round winners order
 let lastRoundWinners = [];  // persisted last winners (shows when no active round)
 let perHoleStrokes = {};    // strokes per user for the current hole (reset after round)
 let roundTimer = null;
-let ROUND_DURATION = 30000; // 30 seconds
+let ROUND_DURATION = 90000; // 1.5min (90 seconds)
 
 /* ---------- STORAGE ---------- */
 function saveScores(){ try { localStorage.setItem('twitchGolfScores', JSON.stringify(scoreboard)); } catch(e) { console.warn(e); } }
@@ -294,16 +300,32 @@ function handleChat({ username, message }){
   if (!username) return;
   const user = username.toLowerCase();
   const msg = (message||'').trim();
-  if (!msg.toLowerCase().startsWith('!putt')) return;
+
+  // block actions during round cooldown if present
+  if (typeof roundCooldown !== 'undefined' && roundCooldown) {
+    showBanner("⛳ Next round starting soon... please wait!");
+    return;
+  }
+
   const parts = msg.split(/\s+/);
   if (parts.length < 3) return;
+  const cmd = parts[0].toLowerCase();
   const aim = parts[1].toLowerCase();
   if (!LOCATIONS.includes(aim)) return;
+
   let power = parseInt(parts[2].replace(/[^\-0-9]/g,''),10);
   if (isNaN(power)) power = 1;
   power = clamp(power, -POWER_MAX, POWER_MAX);
+
   const b = ensureBall(user);
   if (b.moving) return; // per-player lock
+  // prevent shooting if the ball is already in the hole
+  if (b.inHole) {
+  showBanner(`${user}, your ball is already in! ⛳`);
+  return;
+}
+
+
   // add stroke BEFORE shot (every attempt is a stroke)
   addStrokeToPlayer(user);
 
@@ -316,9 +338,36 @@ function handleChat({ username, message }){
   const vy = -Math.sin(angle) * baseVel * dir;
   const windVx = Math.cos(wind.angle) * wind.speed * 0.18;
   const windVy = -Math.sin(wind.angle) * wind.speed * 0.18;
+
   b.moving = true;
-  shots.push({ user, x: b.x, y: b.y, vx: vx + windVx, vy: vy + windVy, life: 0 });
+
+  if (cmd === '!putt') {
+    // normal putt: no vertical component
+    shots.push({ user, x: b.x, y: b.y, vx: vx + windVx, vy: vy + windVy, life: 0, z: 0, vz: 0, type: 'putt' });
+  } else if (cmd === '!drive') {
+    // drive: give an upward velocity (vz) and stronger horizontal multiplier
+    // clamp power-based vz to reasonable values
+    const vz = clamp(6 + Math.abs(power) / 40, 8, 24); // tweakable
+    shots.push({
+      user,
+      x: b.x,
+      y: b.y,
+      vx: (vx + windVx) * DRIVE_POWER_MULT,
+      vy: (vy + windVy) * DRIVE_POWER_MULT,
+      life: 0,
+      z: 0,
+      vz: vz,
+      type: 'drive'
+    });
+    showBanner(`${user} 🔥 drive!`);
+  } else {
+    // not a supported command - do nothing
+    b.moving = false;
+    // rewind the stroke increment if you prefer (optional)
+    // scoreboard[user].strokes = Math.max(0, (scoreboard[user]?.strokes||0) - 1);
+  }
 }
+
 
 /* Test button wiring */
 document.getElementById('testBtn')?.addEventListener('click', ()=> {
@@ -351,24 +400,94 @@ function stepPhysics(dt = 1/60){
   for (let i = shots.length - 1; i >= 0; i--){
     const s = shots[i];
     s.life += dt;
+
+
+    // update horizontal motion
     s.x += s.vx;
     s.y += s.vy;
 
+   
+  // update vertical (3D) for drives / shots that have z
+if (typeof s.z !== 'undefined') {
+  if (s.type === 'drive') {
+    // 🏌️ Cinematic, realistic golf ball flight
+    const airSpeedFactor = 0.13;   // overall slow-motion pacing
+    const gravityUp = 0.90;        // gentle climb slowdown
+    const gravityDown = 0.06;      // smoother fall (not too steep)
+    const drag = 0.978;            // air resistance
+    const apexHeight = 5;         // typical max height before descent
+    const transitionBlend = 100;    // smooth curve blending
+
+    // slow horizontal motion for cinematic flight
+    s.x += s.vx * airSpeedFactor;
+    s.y += s.vy * airSpeedFactor;
+
+    // update height
+    s.z += s.vz * airSpeedFactor;
+
+    // detect and smoothly transition from ascent to descent
+    if (s.z > apexHeight - transitionBlend && s.vz > 0) {
+      // near apex — slow vertical velocity for hang time
+      s.vz -= gravityUp * 0.5;
+    } else if (s.z > apexHeight * 0.6 && s.vz > 0) {
+      // climbing phase
+      s.vz -= gravityUp;
+    } else {
+      // descending phase — starts earlier, smoother, slower fall
+      s.vz -= gravityDown * (1 + s.z / 120);
+    }
+
+    // apply slight air drag to horizontal velocity
+    s.vx *= drag;
+    s.vy *= drag;
+
+    // prevent hovering forever at apex
+    if (s.vz < 0.05 && s.z > apexHeight * 0.8) {
+      s.vz -= 0.08;
+    }
+
+    // ground clamp
+    if (s.z <= 0) {
+      s.z = 0;
+      if (s.vz < 0) s.vz = 0;
+    }
+  } else {
+    // normal putt (non-drive)
+    s.z += s.vz;
+    s.vz -= GRAVITY;
+    if (s.z <= 0) {
+      s.z = 0;
+      if (s.vz < 0) s.vz = 0;
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+    // slope effect (hills) -- use horizontal position only
     const sl = slopeAt(s.x, s.y) * 0.2;
     s.vx += -sl * 0.6;
     s.vy += sl * 0.2;
 
-    if (inZone(s.x, s.y, sandTraps)) { s.vx *= SAND_DRAG; s.vy *= SAND_DRAG; }
+    // drag: reduce horizontal velocity. Drives still experience air drag while airborne,
+    // but landing causes normal friction as before.
+    if (inZone(s.x, s.y, sandTraps) && (s.z <= 1)) { s.vx *= SAND_DRAG; s.vy *= SAND_DRAG; }
     else { s.vx *= AIR_DRAG; s.vy *= AIR_DRAG; }
 
-    // enforce bounds
+    // enforce horizontal bounds (ball cannot leave green)
     if (s.x < ROUGH_ZONE + BALL_RADIUS) { s.x = ROUGH_ZONE + BALL_RADIUS; s.vx = Math.abs(s.vx) * 0.78; }
     if (s.x > WIDTH - ROUGH_ZONE - BALL_RADIUS) { s.x = WIDTH - ROUGH_ZONE - BALL_RADIUS; s.vx = -Math.abs(s.vx) * 0.78; }
     if (s.y < ROUGH_ZONE + BALL_RADIUS) { s.y = ROUGH_ZONE + BALL_RADIUS; s.vy = Math.abs(s.vy) * 0.78; }
     if (s.y > HEIGHT - ROUGH_ZONE - BALL_RADIUS) { s.y = HEIGHT - ROUGH_ZONE - BALL_RADIUS; s.vy = -Math.abs(s.vy) * 0.78; }
 
-    // water hazard
-    if (inZone(s.x, s.y, waterHazards)) {
+    // water hazard: only affects a ball if it is essentially on the ground (z small)
+    if (inZone(s.x, s.y, waterHazards) && (s.z <= 2)) {
       const b = balls[s.user];
       if (b) { b.x = WIDTH/2; b.y = START_Y; b.moving = false; }
       shots.splice(i,1);
@@ -377,56 +496,68 @@ function stepPhysics(dt = 1/60){
     }
 
     const sp = Math.hypot(s.vx, s.vy);
-    if (sp < STOP_SPEED || s.life > MAX_LIFE) {
+
+    // treat low horizontal speed or time expiry as shot end, but if shot still airborne keep it alive
+    if ((sp < STOP_SPEED || s.life > MAX_LIFE) && s.z <= 0) {
       const b = balls[s.user];
       if (b) { b.x = s.x; b.y = s.y; b.moving = false; }
       shots.splice(i,1);
       continue;
     }
 
+    // check hole sink: only if near and not high in air
     const dx = s.x - hole.x, dy = s.y - hole.y, dist = Math.hypot(dx, dy);
-    if (dist < HOLE_RADIUS && sp < 5) {
+    if (dist < HOLE_RADIUS && sp < 5 && s.z <= 2) {
       // sink handling
-     shots.splice(i, 1);
-     const b = balls[s.user];
-     if (b) { b.x = hole.x; b.y = hole.y; b.inHole = true; b.moving = false; }
+      shots.splice(i, 1);
+      const b = balls[s.user];
+      if (b) { b.x = hole.x; b.y = hole.y; b.inHole = true; b.moving = false; }
 
-     // record hole made (cumulative scoreboard)
-     if (!scoreboard[s.user]) scoreboard[s.user] = { strokes: 0, holes: 0 };
-     scoreboard[s.user].holes += 1;
-     saveScores();
+      // record hole made (cumulative scoreboard)
+      if (!scoreboard[s.user]) scoreboard[s.user] = { strokes: 0, holes: 0 };
+      scoreboard[s.user].holes += 1;
+      saveScores();
 
-     // detect hole-in-one (perHoleStrokes == 1)
-     if ((perHoleStrokes[s.user] || 0) === 1) {
-       holeInOnes[s.user] = (holeInOnes[s.user] || 0) + 1;
-       saveHoleInOnes();
-       showBanner(`${s.user} scored a HOLE IN ONE!`);
-     }
+      // detect hole-in-one (perHoleStrokes == 1)
+      if ((perHoleStrokes[s.user] || 0) === 1) {
+        holeInOnes[s.user] = (holeInOnes[s.user] || 0) + 1;
+        saveHoleInOnes();
+        showBanner(`${s.user} scored a HOLE IN ONE!`);
+      }
 
-     // 🟢 ROUND LOGIC
-     if (!roundActive) {
-       // first sink starts the round
-       roundActive = true;
-       roundWinners = [s.user];
-       startRoundTimer();
-       showBanner(`${s.user} starts the round! 30s to get in (next 3 finishers).`);
-     } else if (roundWinners.length < 4 && !roundWinners.includes(s.user)) {
-       roundWinners.push(s.user);
-       showBanner(`${s.user} finished #${roundWinners.length}!`);
-       if (roundWinners.length === 4) {
-         // immediate end if 4 finishers
-         endRound();
-       }
-     }
+      // 🟢 ROUND LOGIC
+      if (!roundActive) {
+        // first sink starts the round
+        roundActive = true;
+        roundWinners = [s.user];
+        startRoundTimer();
+        showBanner(`${s.user} starts the round! 30s to get in (next 3 finishers).`);
+      } else if (roundWinners.length < 4 && !roundWinners.includes(s.user)) {
+        roundWinners.push(s.user);
+        showBanner(`${s.user} finished #${roundWinners.length}!`);
+        if (roundWinners.length === 4) {
+          // immediate end if 4 finishers
+          endRound();
+        }
+      }
 
-     refreshUI();
-     continue;
+      refreshUI();
+      continue;
     }
 
+    // update persistent ball position while shot is moving (if exists)
     const b = balls[s.user];
-    if (b) { b.x = s.x; b.y = s.y; b.moving = true; }
+    if (b) {
+      // if shot has z, we visually attach ball to shot (but store 2D pos)
+      b.x = s.x;
+      b.y = s.y;
+      b.moving = true;
+      // keep per-shot z on the ball so draw uses it
+      b._z = s.z || 0;
+    }
   }
 }
+
 
 /* ---------- ROUND COUNTDOWN UI ---------- */
 let timerEl = null;
@@ -435,18 +566,21 @@ function ensureTimerEl() {
     timerEl = document.createElement('div');
     Object.assign(timerEl.style, {
       position: 'absolute',
-      top: '20px',
-      right: '20px',
-      background: 'rgba(0,0,0,0.7)',
+      left: '50%',
+      top: '45%',                          // roughly center of the green
+      transform: 'translate(-50%, -50%)',
+      background: 'rgba(0, 0, 0, 0.45)',   // semi-transparent dark overlay
       color: '#fff',
       fontFamily: 'Fredoka, Arial, sans-serif',
       fontWeight: '700',
-      fontSize: '22px',
-      padding: '10px 20px',
-      borderRadius: '12px',
-      boxShadow: '0 0 20px rgba(0,0,0,0.4)',
+      fontSize: '42px',                    // larger since it’s central
+      padding: '18px 36px',
+      borderRadius: '16px',
+      boxShadow: '0 0 25px rgba(0,0,0,0.5)',
       zIndex: 4000,
-      transition: 'opacity 0.3s'
+      textAlign: 'center',
+      transition: 'opacity 0.3s',
+      backdropFilter: 'blur(4px)',
     });
     document.body.appendChild(timerEl);
   }
@@ -655,19 +789,19 @@ function drawScene() {
   ctx.fillRect(0, 0, ROUGH_ZONE, HEIGHT);
   ctx.fillRect(WIDTH - ROUGH_ZONE, 0, ROUGH_ZONE, HEIGHT);
 
-
-  // water
-  for (const w of waterHazards){
-    const wg = ctx.createRadialGradient(w.x,w.y,w.r*0.2,w.x,w.y,w.r);
-    wg.addColorStop(0,'#66dfff'); wg.addColorStop(1,'#0077be');
-    ctx.fillStyle = wg; ctx.beginPath(); ctx.arc(w.x,w.y,w.r,0,Math.PI*2); ctx.fill();
-  }
-
   // sand
   for (const s of sandTraps){
     const sg = ctx.createRadialGradient(s.x,s.y,s.r*0.2,s.x,s.y,s.r);
     sg.addColorStop(0,'#f7e4a2'); sg.addColorStop(1,'#d4b66d');
     ctx.fillStyle = sg; ctx.beginPath(); ctx.arc(s.x,s.y,s.r,0,Math.PI*2); ctx.fill();
+  }
+
+  
+  // water
+  for (const w of waterHazards){
+    const wg = ctx.createRadialGradient(w.x,w.y,w.r*0.2,w.x,w.y,w.r);
+    wg.addColorStop(0,'#66dfff'); wg.addColorStop(1,'#0077be');
+    ctx.fillStyle = wg; ctx.beginPath(); ctx.arc(w.x,w.y,w.r,0,Math.PI*2); ctx.fill();
   }
 
   // hole & flag (flag blows with wind)
@@ -682,30 +816,59 @@ function drawScene() {
   if (seagull) drawRealSeagull(seagull);
 
   // shots
-  for (const s of shots) drawBall(s.x, s.y, balls[s.user]?.color || '#fff', s.user, true);
+  for (const s of shots) {
+  const z = s.z || 0;
+  // draw at y minus small offset so flying ball appears above ground if desired
+  drawBall(s.x, s.y - Math.min(z, 40), balls[s.user]?.color || '#fff', s.user, true, z);
+}
+
   // persistent balls
-  for (const u in balls) { const b = balls[u]; drawBall(b.x, b.y, b.color, b.user, b.inHole); }
+  for (const u in balls) {
+  const b = balls[u];
+  const z = b._z || 0;
+  drawBall(b.x, b.y - Math.min(z, 40), b.color, b.user, b.inHole, z);
+}
+
 
   // wind indicator
   drawWindIndicator();
+
+  // draw start indicator so players know spawn location
+  drawStartMarker();
+
 }
 
-function drawBall(x,y,color,user,inMotion=false){
-  // shadow
-  ctx.beginPath(); ctx.ellipse(x+6,y+14,14,6,0,0,Math.PI*2); ctx.fillStyle='rgba(0,0,0,0.22)'; ctx.fill();
-  // ball
-  const grad = ctx.createRadialGradient(x-4,y-4,2,x,y,BALL_RADIUS); grad.addColorStop(0,'#fff'); grad.addColorStop(1,color);
-  ctx.fillStyle = grad; ctx.beginPath(); ctx.arc(x,y,BALL_RADIUS,0,Math.PI*2); ctx.fill();
+function drawBall(x, y, color, user, inMotion = false, z = 0){
+  // scale the ball visually by height (z)
+  const alt = Math.max(0, z || 0);
+  // smoother cinematic easing for altitude scale
+  const scale = 1 + (Math.pow(Math.min(alt / 80, 1), 0.6) * 1.9);
+  const r = BALL_RADIUS * scale;
 
-  // name label - simpler, high contrast
+  // shadow (smaller and softer when high)
+  ctx.beginPath();
+  ctx.ellipse(x + 6, y + 14 + Math.min(alt, 40)*0.1, 14 * scale, 6 * scale, 0, 0, Math.PI*2);
+  ctx.fillStyle = `rgba(0,0,0,${Math.max(0.12 - alt*0.002, 0.06)})`;
+  ctx.fill();
+
+  // ball
+  const grad = ctx.createRadialGradient(x - 4*scale, y - 4*scale, 2*scale, x, y, r);
+  grad.addColorStop(0, '#fff'); grad.addColorStop(1, color);
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI*2);
+  ctx.fill();
+
+  // name label above ball
   ctx.save();
-  ctx.font = '700 18px Arial, sans-serif';
+  ctx.font = `${Math.round(18 * scale)}px Arial, sans-serif`;
   ctx.textAlign = 'center';
   ctx.shadowColor = 'rgba(0,0,0,0.6)'; ctx.shadowBlur = 4;
-  ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(0,0,0,0.9)'; ctx.strokeText(user, x, y - BALL_RADIUS - 14);
-  ctx.fillStyle = '#fff'; ctx.fillText(user, x, y - BALL_RADIUS - 14);
+  ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(0,0,0,0.9)'; ctx.strokeText(user, x, y - r - 14);
+  ctx.fillStyle = '#fff'; ctx.fillText(user, x, y - r - 14);
   ctx.restore();
 }
+
 
 function drawWindIndicator(){
   const cx = WIDTH - 180, cy = 60;
@@ -796,7 +959,7 @@ function startRoundTimer() {
 }
 
 
-function endRound(){
+function endRound() {
   // stop timer
   if (roundTimer) { clearInterval(roundTimer); roundTimer = null; }
 
@@ -805,6 +968,9 @@ function endRound(){
   saveLastWinners();
 
   hideRoundCountdown();
+
+  // ✅ lock the game during cooldown
+  roundCooldown = true;
 
   // show winners screen
   showWinnersScreen();
@@ -820,6 +986,46 @@ function endRound(){
   perHoleStrokes = {};
   refreshUI();
 }
+
+function startNextRoundCountdown() {
+  roundCooldown = true;  // lock all !putt commands
+  let count = 5;
+
+  const el = ensureEl('nextRoundCountdown', 'div', {
+    position: 'absolute',
+    left: '50%',
+    top: '45%',
+    transform: 'translate(-50%, -50%)',
+    background: 'rgba(0,0,0,0.65)',
+    color: '#fff',
+    fontFamily: 'Fredoka, Arial, sans-serif',
+    fontWeight: '700',
+    fontSize: '80px',
+    padding: '40px 70px',
+    borderRadius: '20px',
+    zIndex: 6000,
+    textAlign: 'center',
+    boxShadow: '0 0 30px rgba(0,0,0,0.5)',
+    opacity: '0.95',
+    transition: 'opacity 0.3s',
+  });
+
+  el.textContent = count;
+
+  if (nextRoundTimer) clearInterval(nextRoundTimer);
+  nextRoundTimer = setInterval(() => {
+    count--;
+    if (count > 0) {
+      el.textContent = count;
+    } else {
+      clearInterval(nextRoundTimer);
+      el.remove();
+      roundCooldown = false;
+      showBanner("🏌️ New round has begun! First putt starts it off!");
+    }
+  }, 1000);
+}
+
 
 function showWinnersScreen(){
   const overlay = ensureEl('winnersScreen', 'div', {
@@ -845,13 +1051,24 @@ function showWinnersScreen(){
   overlay.innerHTML = `<div style="font-size:42px;margin-bottom:20px;">${header}</div>${list}`;
 
   setTimeout(() => {
-    overlay.remove();
-    randomizeCourse();
-    // ensure balls cleared already, but also make sure none are marked inHole
-    for (const u in balls) { balls[u].inHole = false; balls[u].moving = false; }
-    refreshUI();
-    showBanner("Next round begins when someone putts!");
-  }, 8000);
+  overlay.remove();
+  randomizeCourse();
+  for (const u in balls) { balls[u].inHole = false; balls[u].moving = false; }
+  refreshUI();
+
+  // 5-second visible countdown before next round unlocks
+  let countdown = 5;
+  const interval = setInterval(() => {
+    showBanner(`Next round starts in ${countdown}...`);
+    countdown--;
+    if (countdown < 0) {
+      clearInterval(interval);
+      roundCooldown = false; // ✅ allow new !putt and !drive
+      showBanner("Go! New round is live!");
+    }
+  }, 1000);
+}, 8000);
+
 }
 
 function clearAllBallsAndShots(){
@@ -975,6 +1192,32 @@ addTP.addEventListener('click', ()=> {
   saveScores();
   showBanner(`Added ${name}`);
 });
+
+/* ---------- START MARKER ---------- */
+let showStartMarker = true;
+
+function drawStartMarker() {
+  if (!showStartMarker) return;
+  const x = WIDTH / 2;
+  const y = START_Y;
+
+  // red dot (same size as ball)
+  ctx.beginPath();
+  ctx.arc(x, y, BALL_RADIUS, 0, Math.PI * 2);
+  ctx.fillStyle = 'red';
+  ctx.fill();
+
+  // "START" label
+  ctx.save();
+  ctx.font = '700 20px Fredoka, Arial, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#fff';
+  ctx.shadowColor = 'rgba(0,0,0,0.7)';
+  ctx.shadowBlur = 6;
+  ctx.fillText('START', x, y + 36);
+  ctx.restore();
+}
+
 
 /* ---------- MAIN LOOP ---------- */
 let lastTime = performance.now();
